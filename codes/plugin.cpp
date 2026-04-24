@@ -14,6 +14,11 @@
 #include <vcg/math/random_generator.h>
 #include <vcg/space/color4.h>
 #include <vcg/space/colormap.h>
+#include <vcg/complex/algorithms/clean.h>
+#include <vcg/complex/algorithms/stat.h>
+#include <vcg/complex/algorithms/smooth.h>
+#include <vcg/complex/algorithms/update/curvature.h>
+#include <vcg/complex/algorithms/update/quality.h>
 #include <wrap/io_trimesh/export.h>
 #include <wrap/io_trimesh/import.h>
 #include <wrap/callback.h>
@@ -383,7 +388,12 @@ QString Plugin::filterInfo(ActionIDType filterId) const
 {
 	switch (filterId) {
 	case FP_VIS:
-		return tr("To Do");
+		return tr(
+			"Visualizes vertex quality using selectable metrics and their combination. "
+			"Supports range-based and optimality-based normalization, optional neighborhood "
+			"smoothing, "
+			"and configurable color mapping (3-color or 5-color, normal or reversed). "
+			"Includes logging and histogram export.");
 	default: assert(0);
 	}
 	return "";
@@ -403,6 +413,27 @@ RichParameterList Plugin::initParameterList(const QAction* a, const MeshDocument
 		vertexMetrics.push_back("Valence");
 		vertexMetrics.push_back("AngleDeviation360");
 		vertexMetrics.push_back("MeanCurvature");
+
+
+		QStringList colorMapModes;
+		colorMapModes.push_back("3-color");
+		colorMapModes.push_back("5-color");
+		parlst.addParam(RichEnum(
+			"colorMapMode",
+			0,
+			colorMapModes,
+			"Color map",
+			"Choose whether the values are visualized using a 3-color or 5-color map."));
+
+		QStringList colorDirectionModes;
+		colorDirectionModes.push_back("Normal");
+		colorDirectionModes.push_back("Reversed");
+		parlst.addParam(RichEnum(
+			"colorDirectionMode",
+			0,
+			colorDirectionModes,
+			"Color direction",
+			"Choose whether the color mapping is used normally or reversed."));
 
 		parlst.addParam(RichEnum(
 			"vertexMetricA",
@@ -534,16 +565,18 @@ QString Plugin::filterScriptFunctionName(ActionIDType filterID)
 
 
 
+
+
 double Plugin::GetMetricOptimalValue(int metricID)
 {
 	switch (metricID) {
-	case 1: return 60.0;            // MaxAngle
-	case 2: return 60.0;            // MinAngle
-	case 3: return 60.0;            // AvgAngle
-	case 4: return 1.0;             // EdgeLengthRatio
-	case 5: return std::log1p(6.0); // Valence (regular triangular mesh -> 6 neighbors)
-	case 6: return 0.0;             // AngleDeviation360
-	case 7: return 0.0;             // MeanCurvature
+	case 1: return 60.0; // MaxAngle
+	case 2: return 60.0; // MinAngle
+	case 3: return 60.0; // AvgAngle
+	case 4: return 1.0;  // EdgeLengthRatio
+	case 5: return 6.0;  // Valence (RAW!)
+	case 6: return 0.0;  // AngleDeviation360
+	case 7: return 0.0;  // MeanCurvature
 	default: return 0.0;
 	}
 }
@@ -697,67 +730,116 @@ Color4b Plugin::InterpolateColor(
 	);
 }
 
-// Function to get a color based on a value, relative to a minimum, optimal, and maximum
-Color4b Plugin::GetColorForValue(double value, double min, double optimal, double max)
+
+Color4b
+Plugin::GetColorForValue(double value, double min, double optimal, double max, int colorMapMode)
 {
-	// Bezpečnostné kontroly
-	// (odporúčam mať hore v súbore aj #include <cmath>)
 	if (!std::isfinite(value))
 		value = optimal;
 
 	if (!std::isfinite(min) || !std::isfinite(optimal) || !std::isfinite(max)) {
-		// niečo je úplne zle -> neutrálny výsledok
 		return vcg::Color4b(0, 255, 0, 255);
 	}
 
-	// Ak je rozsah zdegenerovaný, vráť neutrálnu zelenú
 	if (max <= min) {
 		return vcg::Color4b(0, 255, 0, 255);
 	}
 
-	// že optimal je v rozsahu <min, max>
 	if (optimal < min)
 		optimal = min;
 	if (optimal > max)
 		optimal = max;
 
-	// klasické orezanie mimo rozsah
 	if (value < min)
 		value = min;
 	if (value > max)
 		value = max;
 
-	// Ak je hodnota presne optimálna
+	// =========================
+	// 3-color map
+	// =========================
+	if (colorMapMode == 0) {
+		if (std::fabs(value - optimal) < 1e-12)
+			return vcg::Color4b(0, 255, 0, 255);
+
+		if (value < optimal) {
+			double denom  = (optimal - min);
+			double factor = (denom > 1e-12) ? (value - min) / denom : 0.0;
+			if (!std::isfinite(factor))
+				factor = 0.0;
+			factor = std::max(0.0, std::min(1.0, factor));
+
+			return InterpolateColor(
+				vcg::Color4b(255, 0, 0, 255), // red
+				vcg::Color4b(0, 255, 0, 255), // green
+				factor);
+		}
+		else {
+			double denom  = (max - optimal);
+			double factor = (denom > 1e-12) ? (value - optimal) / denom : 0.0;
+			if (!std::isfinite(factor))
+				factor = 0.0;
+			factor = std::max(0.0, std::min(1.0, factor));
+
+			return InterpolateColor(
+				vcg::Color4b(0, 255, 0, 255), // green
+				vcg::Color4b(0, 0, 255, 255), // blue
+				factor);
+		}
+	}
+
+	// =========================
+	// 5-color map with optimal respected
+	// min -> red
+	// mid-left -> orange
+	// optimal -> green
+	// mid-right -> cyan
+	// max -> blue
+	// =========================
 	if (std::fabs(value - optimal) < 1e-12)
-		return vcg::Color4b(0, 255, 0, 255); // Green for optimal
+		return vcg::Color4b(0, 255, 0, 255);
 
-	// Interpolácia
+	vcg::Color4b red(255, 0, 0, 255);
+	vcg::Color4b orange(255, 165, 0, 255);
+	vcg::Color4b green(0, 255, 0, 255);
+	vcg::Color4b cyan(0, 255, 255, 255);
+	vcg::Color4b blue(0, 0, 255, 255);
+
 	if (value < optimal) {
-		// Interpolácia medzi červenou a zelenou
-		double denom  = (optimal - min);
-		double factor = (denom > 1e-9) ? (value - min) / denom : 0.0;
-		if (!std::isfinite(factor))
-			factor = 0.0;
-		factor = std::max(0.0, std::min(1.0, factor));
+		double denom = (optimal - min);
+		if (denom <= 1e-12)
+			return green;
 
-		return InterpolateColor(vcg::Color4b(255, 0, 0, 255), vcg::Color4b(0, 255, 0, 255), factor);
+		double t = (value - min) / denom;
+		if (!std::isfinite(t))
+			t = 0.0;
+		t = std::max(0.0, std::min(1.0, t));
+
+		if (t < 0.5) {
+			return InterpolateColor(red, orange, t / 0.5);
+		}
+		else {
+			return InterpolateColor(orange, green, (t - 0.5) / 0.5);
+		}
 	}
 	else {
-		// Interpolácia medzi zelenou a modrou
-		double denom  = (max - optimal);
-		double factor = (denom > 1e-9) ? (value - optimal) / denom : 0.0;
-		if (!std::isfinite(factor))
-			factor = 0.0;
-		factor = std::max(0.0, std::min(1.0, factor));
+		double denom = (max - optimal);
+		if (denom <= 1e-12)
+			return green;
 
-		return InterpolateColor(vcg::Color4b(0, 255, 0, 255), vcg::Color4b(0, 0, 255, 255), factor);
+		double t = (value - optimal) / denom;
+		if (!std::isfinite(t))
+			t = 0.0;
+		t = std::max(0.0, std::min(1.0, t));
+
+		if (t < 0.5) {
+			return InterpolateColor(green, cyan, t / 0.5);
+		}
+		else {
+			return InterpolateColor(cyan, blue, (t - 0.5) / 0.5);
+		}
 	}
 }
-
-
-
-
-
 
 
 
@@ -902,11 +984,16 @@ double Plugin::ComputeVertexMetric(int metricID, CMeshO::VertexPointer v, CMeshO
 		}
 		break;
 
+	//case 5: { // Valence (počet susedných facov)
+	//	int count = (int) faces.size();
+	//	result    = log1p((double) count);
+	//	if (!isValidNumber(result))
+	//		result = 0.0;
+	//	break;
+	//}
 	case 5: { // Valence (počet susedných facov)
 		int count = (int) faces.size();
-		result    = log1p((double) count);
-		if (!isValidNumber(result))
-			result = 0.0;
+		result    = (double) count;
 		break;
 	}
 
@@ -919,7 +1006,8 @@ double Plugin::ComputeVertexMetric(int metricID, CMeshO::VertexPointer v, CMeshO
 		break;
 	}
 	case 7: { // MeanCurvature
-		result = ComputeMeanCurvature(v, mesh);
+		//result = ComputeMeanCurvature(v, mesh);
+		result = v->Q();
 		break;
 	}
 
@@ -1221,29 +1309,19 @@ QualityMap Plugin::ApplyNeighborhoodPostprocessing(
 
 
 
-
-// main filter function
 std::map<std::string, QVariant> Plugin::applyFilter(
 	const QAction*           filter,
 	const RichParameterList& par,
 	MeshDocument&            md,
 	unsigned int& /*postConditionMask*/,
 	vcg::CallBackPos*)
-
-
 {
-
-	//auto start = high_resolution_clock::now();
-
 	MeshModel* m = md.mm();
 	if (!m)
 		return std::map<std::string, QVariant>();
 
-
-	// FP_VIS == vertex quality vis 
-	else if (ID(filter) == FP_VIS) {
-
-
+	// FP_VIS == vertex quality vis
+	if (ID(filter) == FP_VIS) {
 		// =========================
 		// Logging setup
 		// =========================
@@ -1267,7 +1345,6 @@ std::map<std::string, QVariant> Plugin::applyFilter(
 		// =========================
 		// Mesh init
 		// =========================
-		MeshModel* m = md.mm();
 		m->updateDataMask(MeshModel::MM_VERTCOLOR);
 		CMeshO& mesh = m->cm;
 		RequirePerVertexColor(mesh);
@@ -1277,15 +1354,44 @@ std::map<std::string, QVariant> Plugin::applyFilter(
 			return std::map<std::string, QVariant>();
 		}
 
-		BuildVertexFaceAdjacency(mesh);
-
-		int   metricA           = par.getEnum("vertexMetricA");
-		int   metricB           = par.getEnum("vertexMetricB");
-		float mixRatio          = par.getFloat("metricMixRatio");
-		int   normalizationMode = par.getEnum("normalizationMode");
+		int   metricA            = par.getEnum("vertexMetricA");
+		int   metricB            = par.getEnum("vertexMetricB");
+		float mixRatio           = par.getFloat("metricMixRatio");
+		int   normalizationMode  = par.getEnum("normalizationMode");
+		int   colorMapMode       = par.getEnum("colorMapMode");
+		int   colorDirectionMode = par.getEnum("colorDirectionMode");
 
 		if (metricA == 0 && metricB != 0)
 			std::swap(metricA, metricB);
+
+		// =========================
+		// Precompute curvature if needed
+		// =========================
+		const bool needMeanCurvature = (metricA == 7 || metricB == 7);
+
+		if (needMeanCurvature) {
+			m->updateDataMask(MeshModel::MM_FACEFACETOPO | MeshModel::MM_VERTCURV);
+			m->updateDataMask(MeshModel::MM_VERTQUALITY);
+
+			tri::UpdateFlags<CMeshO>::FaceBorderFromFF(mesh);
+
+			if (tri::Clean<CMeshO>::CountNonManifoldEdgeFF(mesh) > 0) {
+				throw MLException(
+					"Mesh has non-manifold edges. Mean curvature computation requires "
+					"manifoldness.");
+			}
+
+			int delvert = tri::Clean<CMeshO>::RemoveUnreferencedVertex(mesh);
+			if (delvert > 0) {
+				tri::Allocator<CMeshO>::CompactVertexVector(mesh);
+			}
+
+			tri::UpdateCurvature<CMeshO>::MeanAndGaussian(mesh);
+			tri::UpdateQuality<CMeshO>::VertexFromAttributeName(mesh, "KH");
+		}
+
+		// build adjacency after possible compacting
+		BuildVertexFaceAdjacency(mesh);
 
 		// Per-vertex -> file
 		if (doPerVertex) {
@@ -1296,6 +1402,10 @@ std::map<std::string, QVariant> Plugin::applyFilter(
 			else {
 				L.line("================ FP_VIS ================");
 				L.line("Logging: Per-vertex -> File");
+				L.line(std::string("Color map: ") + (colorMapMode == 0 ? "3-color" : "5-color"));
+				L.line(
+					std::string("Color direction: ") +
+					(colorDirectionMode == 0 ? "Normal" : "Reversed"));
 				L.line(std::string("File: ") + L.filePath.toStdString());
 				L.line(
 					std::string("Normalization mode: ") +
@@ -1305,13 +1415,18 @@ std::map<std::string, QVariant> Plugin::applyFilter(
 					double optAHeader = GetMetricOptimalValue(metricA);
 					double optAMapped = 0.0;
 
-					// transform helper lokálne len pre header
-					if (metricA == 7)
+					if (metricA == 7) {
+						if (optAHeader >= 0.0)
+							optAMapped = std::log1p(optAHeader);
+						else
+							optAMapped = -std::log1p(-optAHeader);
+					}
+					else if (metricA == 4 || metricA == 6) {
 						optAMapped = std::log1p(std::max(0.0, optAHeader));
-					else if (metricA == 4 || metricA == 6)
-						optAMapped = std::log1p(std::max(0.0, optAHeader));
-					else
+					}
+					else {
 						optAMapped = optAHeader;
+					}
 
 					L.line(std::string("A optimum (mapped): ") + std::to_string(optAMapped));
 
@@ -1319,12 +1434,18 @@ std::map<std::string, QVariant> Plugin::applyFilter(
 						double optBHeader = GetMetricOptimalValue(metricB);
 						double optBMapped = 0.0;
 
-						if (metricB == 7)
+						if (metricB == 7) {
+							if (optBHeader >= 0.0)
+								optBMapped = std::log1p(optBHeader);
+							else
+								optBMapped = -std::log1p(-optBHeader);
+						}
+						else if (metricB == 4 || metricB == 6) {
 							optBMapped = std::log1p(std::max(0.0, optBHeader));
-						else if (metricB == 4 || metricB == 6)
-							optBMapped = std::log1p(std::max(0.0, optBHeader));
-						else
+						}
+						else {
 							optBMapped = optBHeader;
+						}
 
 						L.line(std::string("B optimum (mapped): ") + std::to_string(optBMapped));
 					}
@@ -1335,6 +1456,9 @@ std::map<std::string, QVariant> Plugin::applyFilter(
 		}
 
 		if (doOverview) {
+			overview << "colorMapMode=" << (colorMapMode == 0 ? "3-color" : "5-color") << "\n";
+			overview << "colorDirectionMode=" << (colorDirectionMode == 0 ? "Normal" : "Reversed")
+					 << "\n";
 			overview << "mesh.vn=" << mesh.vn << "  mesh.fn=" << mesh.fn << "\n";
 			overview << "metricA=" << metricA << "  metricB=" << metricB
 					 << "  mixRatio=" << mixRatio << "\n";
@@ -1364,28 +1488,9 @@ std::map<std::string, QVariant> Plugin::applyFilter(
 		RunningStats mapAStats, mapBStats;
 		RunningStats scorePreStats, scorePostStats;
 
-		// cache pre curvature
-		std::unordered_map<VertexPtr, double> curvatureCache;
-		curvatureCache.reserve((size_t) std::max(1, mesh.vn));
-
-		auto getCurvatureCached = [&](VertexPtr v) -> double {
-			auto it = curvatureCache.find(v);
-			if (it != curvatureCache.end())
-				return it->second;
-
-			double c = ComputeMeanCurvature(v, mesh);
-			if (!isValidNumber(c) || !IsFinite(c) || c < 0.0)
-				c = 0.0;
-
-			curvatureCache.emplace(v, c);
-			return c;
-		};
-
 		auto computeMetricCached = [&](int metricID, VertexPtr v) -> double {
 			if (metricID == 0)
 				return 0.0;
-			if (metricID == 7)
-				return getCurvatureCached(v);
 
 			double x = ComputeVertexMetric(metricID, v, mesh);
 			if (!isValidNumber(x) || !IsFinite(x))
@@ -1397,16 +1502,20 @@ std::map<std::string, QVariant> Plugin::applyFilter(
 			if (!IsFinite(raw) || !isValidNumber(raw))
 				return 0.0;
 
-			if (metricID == 7) // MeanCurvature
-				return std::log1p(std::max(0.0, raw));
+			if (metricID == 7) { // MeanCurvature
+				if (raw >= 0.0)
+					return std::log1p(raw);
+				else
+					return -std::log1p(-raw);
+			}
 
-			if (metricID == 4 /*EdgeLengthRatio*/ || metricID == 6 /*AngleDeviation360*/)
+			if (metricID == 4 /*EdgeLengthRatio*/ || metricID == 5 /*valencia*/ || metricID == 6 /*AngleDeviation360*/)
 				return std::log1p(std::max(0.0, raw));
 
 			return raw;
 		};
 
-		// ---- hodnoty pre všetky vertexy ----
+		// ---- values for all vertices ----
 		std::unordered_map<VertexPtr, double> rawAmap, rawBmap;
 		rawAmap.reserve((size_t) mesh.vn);
 		rawBmap.reserve((size_t) mesh.vn);
@@ -1420,7 +1529,7 @@ std::map<std::string, QVariant> Plugin::applyFilter(
 
 		const bool sameMetric = (metricB != 0 && metricA == metricB);
 
-		// 1) zber raw + mapped
+		// 1) collect raw + mapped
 		for (auto vi = mesh.vert.begin(); vi != mesh.vert.end(); ++vi) {
 			if (vi->IsD()) {
 				skippedDeleted++;
@@ -1471,7 +1580,6 @@ std::map<std::string, QVariant> Plugin::applyFilter(
 		double minA = 0.0, maxA = 1.0;
 		double minB = 0.0, maxB = 1.0;
 
-		// A robust
 		if (!Avals.empty()) {
 			std::vector<double> tmp = Avals;
 			double              pLo = Percentile(tmp, P_LO);
@@ -1491,7 +1599,6 @@ std::map<std::string, QVariant> Plugin::applyFilter(
 			}
 		}
 
-		// B robust
 		if (metricB != 0 && !Bvals.empty()) {
 			std::vector<double> tmp = Bvals;
 			double              pLo = Percentile(tmp, P_LO);
@@ -1616,7 +1723,9 @@ std::map<std::string, QVariant> Plugin::applyFilter(
 			}
 			else {
 				double optA = transformForMapping(metricA, GetMetricOptimalValue(metricA));
-				normA       = normAroundOptimal(aT, optA, minA, maxA);
+				double loA  = std::min(minA, optA);
+				double hiA  = std::max(maxA, optA);
+				normA       = normAroundOptimal(aT, optA, loA, hiA);
 			}
 
 			double score = normA;
@@ -1635,7 +1744,9 @@ std::map<std::string, QVariant> Plugin::applyFilter(
 				}
 				else {
 					double optB = transformForMapping(metricB, GetMetricOptimalValue(metricB));
-					normB       = normAroundOptimal(bT, optB, minB, maxB);
+					double loB  = std::min(minB, optB);
+					double hiB  = std::max(maxB, optB);
+					normB       = normAroundOptimal(bT, optB, loB, hiB);
 				}
 
 				score = safeMix * normA + (1.0 - safeMix) * normB;
@@ -1676,7 +1787,6 @@ std::map<std::string, QVariant> Plugin::applyFilter(
 
 		NeighborhoodMode neighMode = static_cast<NeighborhoodMode>(modeInt);
 
-		bool neighApplied   = false;
 		bool higherIsBetter = true;
 
 		if (doOverview) {
@@ -1693,8 +1803,6 @@ std::map<std::string, QVariant> Plugin::applyFilter(
 		}
 
 		if (radius > 0 && neighMode != NEIGH_OFF && weight > 0.0) {
-			neighApplied = true;
-
 			auto       adj        = BuildVertexAdjacency(mesh);
 			QualityMap neighScore = ComputeNeighborhoodScore(mesh, scoreMap, adj, radius);
 
@@ -1784,11 +1892,14 @@ std::map<std::string, QVariant> Plugin::applyFilter(
 			if (itS != scoreMap.end() && IsFinite(itS->second) && isValidNumber(itS->second))
 				s = itS->second;
 
-			vi->C() = GetColorForValue(s, 0.0, opt, 1.0);
+			double colorValue = s;
+			if (colorDirectionMode == 1)
+				colorValue = 1.0 - s;
+
+			vi->C() = GetColorForValue(colorValue, 0.0, opt, 1.0, colorMapMode);
+
 			coloredVerts++;
 		}
-
-
 
 		if (doOverview) {
 			overview << "\n--- Coloring ---\n";
@@ -1818,8 +1929,6 @@ std::map<std::string, QVariant> Plugin::applyFilter(
 			L.line(std::string("Histogram image: ") + histPath.toStdString());
 		}
 
-
-
 		// =========================
 		// Flush logs
 		// =========================
@@ -1830,7 +1939,8 @@ std::map<std::string, QVariant> Plugin::applyFilter(
 			else {
 				if (!L.flushToFileAppend()) {
 					md.Log.log(
-						GLLogStream::WARNING, "Master’s Thesis - vertex quality: failed to write per-vertex log file.");
+						GLLogStream::WARNING,
+						"Master’s Thesis - vertex quality: failed to write per-vertex log file.");
 				}
 				L.clear();
 			}
@@ -1839,9 +1949,9 @@ std::map<std::string, QVariant> Plugin::applyFilter(
 		return std::map<std::string, QVariant>();
 	}
 
-
 	return std::map<std::string, QVariant>();
 }
+
 
 int Plugin::postCondition(const QAction* filter) const
 {

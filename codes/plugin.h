@@ -30,7 +30,7 @@ private:
 	double CalculateDistance(const vcg::Point3f& p1, const vcg::Point3f& p2);
 	bool isNegativeNaN(double x);
 	Color4b InterpolateColor(const vcg::Color4b& colorStart, const vcg::Color4b& colorEnd, double factor);
-	Color4b GetColorForValue(double value, double min, double optimal, double max);
+	Color4b GetColorForValue(double value, double min, double optimal, double max, int colorMapMode);
 	double ComputeMeanCurvature(CMeshO::VertexPointer v, CMeshO& mesh);
 	double  ComputeVertexMetric(int metricID, CMeshO::VertexPointer v, CMeshO& mesh);
 	bool  Plugin::isValidNumber(double x);
