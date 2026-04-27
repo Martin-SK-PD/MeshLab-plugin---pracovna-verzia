@@ -1008,7 +1008,8 @@ double Plugin::ComputeVertexMetric(int metricID, CMeshO::VertexPointer v, CMeshO
 	case 7: { // MeanCurvature
 		//result = ComputeMeanCurvature(v, mesh);
 		result = v->Q();
-		break;
+		//result = 0.0;
+		break; 
 	}
 
 	default: result = 0.0;
@@ -1353,7 +1354,7 @@ std::map<std::string, QVariant> Plugin::applyFilter(
 			throw MLException("The mesh must contain only triangles");
 			return std::map<std::string, QVariant>();
 		}
-
+		 
 		int   metricA            = par.getEnum("vertexMetricA");
 		int   metricB            = par.getEnum("vertexMetricB");
 		float mixRatio           = par.getFloat("metricMixRatio");
@@ -1364,14 +1365,23 @@ std::map<std::string, QVariant> Plugin::applyFilter(
 		if (metricA == 0 && metricB != 0)
 			std::swap(metricA, metricB);
 
+
+		std::unordered_map<VertexPtr, double> curvatureMap;
+
+		auto resetCurvatureData = [&]() {
+			tri::Allocator<CMeshO>::DeletePerVertexAttribute(mesh, "KH");
+		};
+
+
 		// =========================
 		// Precompute curvature if needed
 		// =========================
-		const bool needMeanCurvature = (metricA == 7 || metricB == 7);
 
+		const bool needMeanCurvature = (metricA == 7 || metricB == 7);
 		if (needMeanCurvature) {
+			resetCurvatureData();
+
 			m->updateDataMask(MeshModel::MM_FACEFACETOPO | MeshModel::MM_VERTCURV);
-			m->updateDataMask(MeshModel::MM_VERTQUALITY);
 
 			tri::UpdateFlags<CMeshO>::FaceBorderFromFF(mesh);
 
@@ -1381,14 +1391,31 @@ std::map<std::string, QVariant> Plugin::applyFilter(
 					"manifoldness.");
 			}
 
-			int delvert = tri::Clean<CMeshO>::RemoveUnreferencedVertex(mesh);
-			if (delvert > 0) {
-				tri::Allocator<CMeshO>::CompactVertexVector(mesh);
+			tri::UpdateCurvature<CMeshO>::MeanAndGaussian(mesh);
+
+			curvatureMap.reserve((size_t) mesh.vn);
+
+			auto kh = tri::Allocator<CMeshO>::GetPerVertexAttribute<float>(mesh, "KH");
+
+			for (auto vi = mesh.vert.begin(); vi != mesh.vert.end(); ++vi) {
+				if (!vi->IsD()) {
+					double h = kh[vi];
+
+					if (!isValidNumber(h) || !IsFinite(h))
+						h = 0.0;
+
+					curvatureMap[&*vi] = h;
+				}
 			}
 
-			tri::UpdateCurvature<CMeshO>::MeanAndGaussian(mesh);
-			tri::UpdateQuality<CMeshO>::VertexFromAttributeName(mesh, "KH");
+			tri::Allocator<CMeshO>::DeletePerVertexAttribute(mesh, "KH");
 		}
+		else {
+			resetCurvatureData();
+		}
+
+
+		
 
 		// build adjacency after possible compacting
 		BuildVertexFaceAdjacency(mesh);
@@ -1492,6 +1519,13 @@ std::map<std::string, QVariant> Plugin::applyFilter(
 			if (metricID == 0)
 				return 0.0;
 
+			if (metricID == 7) { //curvatue
+				auto it = curvatureMap.find(v);
+				if (it != curvatureMap.end())
+					return it->second;
+				return 0.0;
+			}
+
 			double x = ComputeVertexMetric(metricID, v, mesh);
 			if (!isValidNumber(x) || !IsFinite(x))
 				x = 0.0;
@@ -1514,6 +1548,8 @@ std::map<std::string, QVariant> Plugin::applyFilter(
 
 			return raw;
 		};
+
+
 
 		// ---- values for all vertices ----
 		std::unordered_map<VertexPtr, double> rawAmap, rawBmap;
@@ -1945,6 +1981,9 @@ std::map<std::string, QVariant> Plugin::applyFilter(
 				L.clear();
 			}
 		}
+
+		if (needMeanCurvature)
+			resetCurvatureData();
 
 		return std::map<std::string, QVariant>();
 	}
